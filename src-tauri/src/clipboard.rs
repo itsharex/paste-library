@@ -3,11 +3,12 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use crate::models::{
-    AppSettings, ClipboardContentType, ClipboardItem, ClipboardMetadata, ClearHistoryRequest, GetHistoryRequest,
-    SearchRequest,
+    AdvancedSearchRequest, AppSettings, ClipboardContentType, ClipboardItem, ClipboardMetadata, ClearHistoryRequest,
+    GetHistoryRequest, SearchRequest,
 };
 use crate::storage::Database;
 
+#[derive(Clone)]
 pub struct ClipboardManager {
     database: Arc<Database>,
     settings: Arc<Mutex<AppSettings>>,
@@ -43,10 +44,12 @@ impl ClipboardManager {
         }
         drop(settings);
 
-        let (content_type, content) = if let Some(html_content) = html {
-            (ClipboardContentType::Html, html_content)
+        let (content_type, content, text_content) = if let Some(html_content) = html {
+            // HTML 类型：content 存储 HTML，text_content 存储纯文本
+            (ClipboardContentType::Html, html_content, Some(text))
         } else {
-            (ClipboardContentType::Text, text)
+            // 纯文本类型：content 和 text_content 都存储纯文本
+            (ClipboardContentType::Text, text.clone(), Some(text))
         };
 
         let mut hasher = Sha256::new();
@@ -59,6 +62,7 @@ impl ClipboardManager {
             content,
             created_at: chrono::Utc::now(),
             content_hash,
+            text_content,
             metadata: None,
             file_paths: None,
             thumbnail_path: None,
@@ -122,6 +126,7 @@ impl ClipboardManager {
             content,
             created_at: chrono::Utc::now(),
             content_hash,
+            text_content: None,
             metadata,
             file_paths,
             thumbnail_path,
@@ -162,6 +167,13 @@ impl ClipboardManager {
             .map_err(|e| e.to_string())
     }
 
+    /// 高级搜索（支持标签和类型过滤）
+    pub fn search_history_advanced(&self, request: AdvancedSearchRequest) -> Result<Vec<ClipboardItem>, String> {
+        self.database
+            .search_history_advanced(&request)
+            .map_err(|e| e.to_string())
+    }
+
     pub fn delete_item(&self, id: i64) -> Result<(), String> {
         self.database.delete_item(id).map_err(|e| e.to_string())
     }
@@ -179,8 +191,8 @@ impl ClipboardManager {
     /// 
     /// # 返回
     /// - 清理的记录数量
-    pub fn startup_cleanup(&self) -> Result<i64, String> {
-        let settings = self.settings.blocking_lock();
+    pub async fn startup_cleanup(&self) -> Result<i64, String> {
+        let settings = self.settings.lock().await;  // 防止启动时，数据库被锁定，导致无法访问数据库
         let max_history_count = settings.max_history_count;
         let auto_cleanup_days = settings.auto_cleanup_days;
         drop(settings);

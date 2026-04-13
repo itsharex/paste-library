@@ -46,8 +46,6 @@
       <HotkeySection
         v-else-if="activeMenu === 'hotkey'"
         :form="form"
-        :shortcut-error="shortcutError"
-        @hotkey-record="validateHotkey"
       />
 
       <BackupSection
@@ -83,11 +81,10 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted, watch, reactive } from 'vue';
+import { ref, onMounted, watch, reactive } from 'vue';
 import { useSettings } from '@/composables/useSettings';
 import { useClipboard } from '@/composables/useClipboard';
 import { invoke } from '@tauri-apps/api/core';
-import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { check, type Update } from '@tauri-apps/plugin-updater';
 import { relaunch } from '@tauri-apps/plugin-process';
 import type { AppSettings } from '@/types';
@@ -117,7 +114,6 @@ const form = reactive<AppSettings>({
   max_history_count: 5000,
   auto_cleanup_days: 30,
   window_position: 'remember',
-  smart_activate: true,
   copy_sound: false,
   search_position: 'bottom',
   focus_search_on_activate: false,
@@ -133,14 +129,13 @@ const form = reactive<AppSettings>({
   hotkey: 'Alt+V',
   auto_start: false,
   number_key_shortcut: 'ctrl',
+  pin_shortcut: 'Ctrl+Shift+P',
 });
 
-const shortcutError = ref('');
 const storagePaths = ref<Record<string, string>>({
   data_dir: '',
   log_dir: '',
 });
-let unlistenShortcutError: UnlistenFn | null = null;
 let isInitializing = true;
 
 // 更新检查相关状态
@@ -172,18 +167,7 @@ onMounted(async () => {
     checkForUpdates();
   }, 1000);
 
-  // 监听快捷键注册失败事件
-  unlistenShortcutError = await listen<string>('shortcut-registration-failed', (event) => {
-    shortcutError.value = `快捷键 "${event.payload}" 已被其他程序占用，请使用备用快捷键 Ctrl+Shift+V，或修改快捷键后重启应用`;
-  });
-
   isInitializing = false;
-});
-
-onUnmounted(() => {
-  if (unlistenShortcutError) {
-    unlistenShortcutError();
-  }
 });
 
 const syncFromSettings = () => {
@@ -209,7 +193,6 @@ const resetSettings = async () => {
       max_history_count: 5000,
       auto_cleanup_days: 30,
       window_position: 'remember',
-      smart_activate: true,
       copy_sound: false,
       search_position: 'top',
       focus_search_on_activate: false,
@@ -224,6 +207,7 @@ const resetSettings = async () => {
       auto_sort: false,
       auto_start: false,
       number_key_shortcut: 'ctrl',
+      pin_shortcut: 'Ctrl+Shift+P',
     });
 
     try {
@@ -233,16 +217,6 @@ const resetSettings = async () => {
     }
 
     isInitializing = false;
-  }
-};
-
-const validateHotkey = async () => {
-  try {
-    await invoke('validate_shortcut', { hotkey: form.hotkey });
-    shortcutError.value = '';
-  } catch (error) {
-    shortcutError.value = '快捷键格式无效';
-    form.hotkey = 'Alt+V';
   }
 };
 

@@ -15,37 +15,72 @@
         />
         <button
           v-if="canPinCurrentSearch"
-          class="pin-btn"
+          class="icon-btn"
           title="固定当前搜索"
           @click="pinCurrentSearch"
         >
-          <svg
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            stroke-width="2"
-          >
-            <path
-              d="M12 2a2 2 0 0 0-2 2v3.586l-3.707 3.707A1 1 0 0 0 6 12v2a1 1 0 0 0 1 1h3l2 7 2-7h3a1 1 0 0 0 1-1v-2a1 1 0 0 0-.293-.707L14 7.586V4a2 2 0 0 0-2-2z"
-            />
-          </svg>
+          <BookmarkPlus :size="18" />
+        </button>
+        <!-- 钉住模式按钮 -->
+        <button
+          class="icon-btn"
+          :class="{ 'is-active': isPinned }"
+          :title="
+            isPinned
+              ? '取消钉住'
+              : `钉住面板 (${settings.pin_shortcut || 'Ctrl+Shift+P'})`
+          "
+          @click="togglePinMode"
+        >
+          <PinIcon :size="18" />
+        </button>
+        <!-- 设置按钮 -->
+        <button
+          class="icon-btn"
+          title="打开设置"
+          @click="openSettings"
+        >
+          <SettingsIcon :size="18" />
         </button>
       </div>
     </div>
 
     <!-- 标签栏 -->
     <TabBar
-      v-model="activeTab"
+      :active-fixed-tab="activeFixedTab"
+      :active-pinned-ids="activePinnedIds"
       :fixed-tabs="FIXED_TABS"
       :pinned-searches="pinnedSearches"
-      @unpin="unpinSearch"
+      @tab-click="handleTabClick"
+      @pinned-click="handlePinnedTabClick"
+      @unpin="handleUnpinSearch"
       @reorder="reorderPinnedSearches"
     />
 
     <!-- 列表内容 -->
     <div ref="listContainerRef" class="list-container" tabindex="-1">
+      <!-- 搜索加载指示器 -->
+      <div v-if="isSearching" class="search-loading">
+        <svg
+          class="loading-spinner"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="2"
+        >
+          <circle
+            cx="12"
+            cy="12"
+            r="10"
+            stroke-dasharray="60"
+            stroke-dashoffset="20"
+          />
+        </svg>
+        <span>搜索中...</span>
+      </div>
+
       <EmptyState
-        v-if="filteredHistory.length === 0"
+        v-else-if="filteredHistory.length === 0"
         :has-search-query="!!searchQuery"
       />
 
@@ -56,6 +91,7 @@
         :items="filteredHistory"
         :min-item-size="60"
         key-field="id"
+        @scroll.native="handleScroll"
         v-slot="{ item, index, active }"
       >
         <DynamicScrollerItem
@@ -71,15 +107,15 @@
             :highlight-keywords="parsedQuery.keywords"
             @click="handleItemClick"
             @dblclick="handleItemDoubleClick"
-            @contextmenu="(event: MouseEvent) => handleItemContextMenu(event, item, index)"
+            @contextmenu="
+              (event: MouseEvent) => handleItemContextMenu(event, item, index)
+            "
             @quick-action="handleQuickAction"
             @remove-tag="handleRemoveTag"
             @tag-click="handleTagClick"
           />
         </DynamicScrollerItem>
       </DynamicScroller>
-
-      <div v-if="loading" class="loading-more">加载中...</div>
     </div>
 
     <!-- 右键上下文菜单 -->
@@ -116,23 +152,28 @@
 </template>
 
 <script setup lang="ts">
+import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+import { BookmarkPlus, Pin as PinIcon, Settings as SettingsIcon } from "lucide-vue-next";
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
+import { DynamicScroller, DynamicScrollerItem } from "vue-virtual-scroller";
 import { useClipboard } from "@/composables/useClipboard";
+import { useClipboardList } from "@/composables/useClipboardList";
+import { useKeyboardNavigation } from "@/composables/useKeyboardNavigation";
+import { usePinMode } from "@/composables/usePinMode";
+import { usePinnedSearches } from "@/composables/usePinnedSearches";
+import { useScrollHandler } from "@/composables/useScrollHandler";
+import { useSearch } from "@/composables/useSearch";
 import { useSettings } from "@/composables/useSettings";
 import {
   addSearchHistory,
   clearSearchHistory,
   getSearchHistory,
-  matchItemWithQuery,
   parseSearchQuery,
+  removeTypeTokensFromQuery,
   removeSearchHistory as removeSearchHistoryItem,
-  type ParsedQuery,
 } from "@/composables/useSmartSearch";
-import type { ClipboardItem as ClipboardItemType, PinnedSearch } from "@/types";
-import { invoke } from "@tauri-apps/api/core";
-import { getCurrentWindow } from "@tauri-apps/api/window";
-import { writeText } from "tauri-plugin-clipboard-x-api";
-import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
-import { DynamicScroller, DynamicScrollerItem } from "vue-virtual-scroller";
 import ClipboardItem from "../ClipboardItem.vue";
 import ContextMenu from "../ContextMenu.vue";
 import DrawerEditor from "../DrawerEditor.vue";
@@ -142,9 +183,54 @@ import DeleteConfirmDialog from "./DeleteConfirmDialog.vue";
 import EmptyState from "./EmptyState.vue";
 import TabBar from "./TabBar.vue";
 
+const FIXED_TABS = [
+  { key: "all", label: "全部" },
+  { key: "text", label: "文本" },
+  { key: "image", label: "图片" },
+  { key: "file", label: "文件" },
+];
+
+const TAB_TYPE_TOKEN: Record<string, string> = {
+  text: "文本",
+  image: "图片",
+  file: "文件",
+};
+
+const TEXT_TYPES = ["text", "html", "rtf"];
+const IMAGE_TYPES = ["image"];
+const FILE_TYPES = ["file", "files", "folder"];
+
+type DynamicScrollerAdapter = {
+  scrollToItem: (index: number, position: string) => void;
+};
+
+const createScrollerAdapter = (
+  scroller: InstanceType<typeof DynamicScroller>,
+): DynamicScrollerAdapter => ({
+  scrollToItem: (index: number, position: string) => {
+    scroller.scrollToItem(index);
+    if (position === "center") {
+      nextTick(() => {
+        const el = scroller.$el as HTMLElement | undefined;
+        if (!el) return;
+        const containerHeight = el.clientHeight;
+        const selectedEl = el.querySelector(
+          ".clipboard-item.is-selected",
+        ) as HTMLElement | null;
+        if (!selectedEl) return;
+        const itemRect = selectedEl.getBoundingClientRect();
+        const containerRect = el.getBoundingClientRect();
+        const relativeTop = itemRect.top - containerRect.top;
+        const offset =
+          relativeTop - (containerHeight - itemRect.height) / 2;
+        el.scrollTop += offset;
+      });
+    }
+  },
+});
+
 const {
   history,
-  lastCopyTime,
   init: initClipboard,
   loadHistory,
   deleteItem,
@@ -152,56 +238,217 @@ const {
 } = useClipboard();
 
 const { settings } = useSettings();
+const { isPinned, togglePinMode, loadPinMode } = usePinMode();
 
-// 搜索相关
 const smartSearchRef = ref<InstanceType<typeof SmartSearch> | null>(null);
+const scrollerRef = ref<InstanceType<typeof DynamicScroller> | null>(null);
 const searchQuery = ref("");
 const searchHistory = ref<string[]>([]);
-const parsedQuery = computed<ParsedQuery>(() =>
-  parseSearchQuery(searchQuery.value)
-);
-
-// 标签相关
-const FIXED_TABS = [
-  { key: "all", label: "全部" },
-  { key: "text", label: "文本" },
-  { key: "image", label: "图片" },
-  { key: "file", label: "文件" },
-];
-const activeTab = ref("all");
-const pinnedSearches = ref<PinnedSearch[]>([]);
-const PINNED_SEARCH_STORAGE_KEY = "paste_library_pinned_searches";
-
-// 列表状态
-const loading = ref(false);
-const hasMore = ref(true);
-const offset = ref(0);
-const limit = 50;
-const selectedIndex = ref(-1);
-const listContainerRef = ref<HTMLElement | null>(null);
-const scrollerRef = ref<InstanceType<typeof DynamicScroller> | null>(null);
-
-// 右键菜单状态
-const contextMenuVisible = ref(false);
-const contextMenuPosition = ref({ x: 0, y: 0 });
-const contextMenuItem = ref<ClipboardItemType | null>(null);
-
-// 删除确认状态
-const deleteConfirmVisible = ref(false);
-const itemToDelete = ref<ClipboardItemType | null>(null);
-
-// Drawer 状态
-const drawerVisible = ref(false);
-const drawerItem = ref<ClipboardItemType | null>(null);
-
-// 标签管理器状态
-const tagManagerVisible = ref(false);
-const tagManagerItem = ref<ClipboardItemType | null>(null);
-
-// 激活标记
 const hasActivated = ref(false);
+const savedSearchQuery = ref("");
+const savedScrollPosition = ref(0);
 
-// 加载搜索历史
+const {
+  pinnedSearches,
+  canPinCurrentSearch,
+  loadPinnedSearches,
+  pinCurrentSearch,
+  unpinSearch: unpinPinnedSearch,
+  reorderPinnedSearches,
+} = usePinnedSearches(searchQuery);
+
+const scrollerForSearch = ref<DynamicScrollerAdapter | null>(null);
+watch(scrollerRef, (value) => {
+  scrollerForSearch.value = value ? createScrollerAdapter(value) : null;
+});
+
+const selectedIndexFallback = ref(-1);
+const onSearchComplete = (resultCount: number) => {
+  if (resultCount > 0 && selectedIndexFallback.value < 0) {
+    selectedIndexFallback.value = 0;
+  }
+};
+
+const {
+  filteredHistory,
+  isSearching,
+  searchHasMore,
+  parsedQuery,
+  loadMoreResults,
+  handleSmartSearch: handleSmartSearchInner,
+} = useSearch({
+  searchQuery,
+  history,
+  scrollerRef: scrollerForSearch,
+  onSearchComplete,
+});
+
+const activePinnedIds = computed<string[]>(() => {
+  const currentParsed = parsedQuery.value;
+  if (!currentParsed.isValid) {
+    return [];
+  }
+
+  return pinnedSearches.value
+    .filter((ps) => {
+      const pinnedParsed = parseSearchQuery(ps.query);
+      if (!pinnedParsed.isValid) return false;
+
+      const tagsMatch = pinnedParsed.tags.every((t) =>
+        currentParsed.tags.some((ct) => ct.toLowerCase() === t.toLowerCase()),
+      );
+      const typesMatch = pinnedParsed.types.every((t) =>
+        currentParsed.types.includes(t),
+      );
+      const keywordsMatch = pinnedParsed.keywords.every((k) =>
+        currentParsed.keywords.some(
+          (ck) => ck.toLowerCase() === k.toLowerCase(),
+        ),
+      );
+
+      return tagsMatch && typesMatch && keywordsMatch;
+    })
+    .map((ps) => ps.id);
+});
+
+const derivedActiveTab = computed(() => {
+  const types = parsedQuery.value.types;
+
+  if (types.length === 0) {
+    return "all";
+  }
+
+  if (types.every((type) => TEXT_TYPES.includes(type))) {
+    return "text";
+  }
+
+  if (types.every((type) => IMAGE_TYPES.includes(type))) {
+    return "image";
+  }
+
+  if (types.every((type) => FILE_TYPES.includes(type))) {
+    return "file";
+  }
+
+  return "all";
+});
+
+const activeFixedTab = computed(() => derivedActiveTab.value);
+
+const handleSmartSearch = async (
+  query: string,
+  shouldScrollToTop = true,
+) => {
+  searchQuery.value = query;
+  await handleSmartSearchInner(shouldScrollToTop);
+};
+
+const resetDefaultList = () => {
+  filteredHistory.value = history.value.slice(0, 50);
+  searchHasMore.value = history.value.length > 50;
+};
+
+const resetPanelState = () => {
+  searchQuery.value = "";
+  savedSearchQuery.value = "";
+  savedScrollPosition.value = 0;
+  resetDefaultList();
+  selectedIndexFallback.value = -1;
+  selectedIndex.value = -1;
+  if (scrollerRef.value) {
+    scrollerRef.value.scrollToItem(0, "start");
+  }
+};
+
+const {
+  uiState,
+  executeClipboardAction,
+  handleItemClick,
+  handleItemDoubleClick,
+  handleItemContextMenu,
+  handleQuickAction,
+  handleDrawerCopy,
+  handleDrawerPaste,
+  handleSaveAsNew,
+  confirmDelete,
+  cancelDelete,
+  handleTagManagerSave,
+  handleRemoveTag,
+  handleContextMenuAction,
+} = useClipboardList({
+  settings,
+  isPinned,
+  history,
+  deleteItem,
+  loadHistory,
+  restoreToClipboard,
+  resetPanelState,
+});
+
+const {
+  contextMenuVisible,
+  contextMenuPosition,
+  contextMenuItem,
+  drawerVisible,
+  drawerItem,
+  tagManagerVisible,
+  tagManagerItem,
+  deleteConfirmVisible,
+  selectedIndex,
+} = uiState;
+
+watch(selectedIndex, (value) => {
+  if (value >= 0 && hasActivated.value) {
+    selectedIndexFallback.value = value;
+  }
+});
+
+const smartSearchForKeyboard = ref<{ focus: () => void } | null>(null);
+watch(smartSearchRef, (value) => {
+  smartSearchForKeyboard.value = value
+    ? {
+        focus: () => value.focus(),
+      }
+    : null;
+});
+
+const scrollerForKeyboard = ref<DynamicScrollerAdapter | null>(null);
+watch(scrollerRef, (value) => {
+  scrollerForKeyboard.value = value ? createScrollerAdapter(value) : null;
+});
+
+const handleEscape = async () => {
+  savedSearchQuery.value = searchQuery.value;
+  savedScrollPosition.value = scrollerRef.value?.$el?.scrollTop || 0;
+  hasActivated.value = false;
+  selectedIndex.value = -1;
+  await invoke("hide_clipboard_window");
+};
+
+const handleClearSearch = async () => {
+  searchQuery.value = "";
+  await handleSmartSearchInner(true);
+};
+
+const { handleKeyDown } = useKeyboardNavigation({
+  filteredHistory,
+  selectedIndex,
+  searchQuery,
+  settings,
+  smartSearchRef: smartSearchForKeyboard,
+  scrollerRef: scrollerForKeyboard,
+  executeClipboardAction,
+  onEscape: handleEscape,
+  onTogglePinMode: togglePinMode,
+  handleSmartSearch: handleClearSearch,
+});
+
+const { handleScroll, cleanup: cleanupScroll } = useScrollHandler({
+  isSearching,
+  searchHasMore,
+  loadMoreResults,
+});
+
 const loadSearchHistory = () => {
   searchHistory.value = getSearchHistory();
 };
@@ -216,180 +463,14 @@ const clearAllHistory = () => {
   loadSearchHistory();
 };
 
-// 固定搜索相关
-const loadPinnedSearches = () => {
-  try {
-    const stored = localStorage.getItem(PINNED_SEARCH_STORAGE_KEY);
-    if (stored) {
-      pinnedSearches.value = JSON.parse(stored);
-    }
-  } catch {
-    pinnedSearches.value = [];
-  }
-};
-
-const savePinnedSearches = () => {
-  try {
-    localStorage.setItem(
-      PINNED_SEARCH_STORAGE_KEY,
-      JSON.stringify(pinnedSearches.value)
-    );
-  } catch {
-    // 忽略存储错误
-  }
-};
-
-const canPinCurrentSearch = computed(() => {
-  const query = searchQuery.value.trim();
-  if (!query) return false;
-  return !pinnedSearches.value.some((ps) => ps.query === query);
-});
-
-const pinCurrentSearch = () => {
-  const query = searchQuery.value.trim();
-  if (!query) return;
-
-  let label = query;
-  if (query.length > 10) {
-    label = query.slice(0, 10) + "...";
-  }
-
-  const newPinned: PinnedSearch = {
-    id: `pinned_${Date.now()}`,
-    label,
-    query,
-    created_at: Date.now(),
-  };
-
-  pinnedSearches.value.push(newPinned);
-  savePinnedSearches();
-  activeTab.value = newPinned.id;
-};
-
-const unpinSearch = (id: string) => {
-  const index = pinnedSearches.value.findIndex((ps) => ps.id === id);
-  if (index > -1) {
-    pinnedSearches.value.splice(index, 1);
-    savePinnedSearches();
-
-    if (activeTab.value === id) {
-      activeTab.value = "all";
-      searchQuery.value = "";
-    }
-  }
-};
-
-const reorderPinnedSearches = (fromIndex: number, toIndex: number) => {
-  const item = pinnedSearches.value.splice(fromIndex, 1)[0];
-  pinnedSearches.value.splice(toIndex, 0, item);
-  savePinnedSearches();
-};
-
-// 处理标签点击
-watch(activeTab, (key) => {
-  const pinned = pinnedSearches.value.find((ps) => ps.id === key);
-  if (pinned) {
-    searchQuery.value = pinned.query;
-  } else if (key !== "all") {
-    searchQuery.value = "";
-  } else {
-    searchQuery.value = "";
-  }
-});
-
-// 智能激活
-const handleSmartActivate = async () => {
-  smartSearchRef.value?.focus();
-
-  if (settings.value.smart_activate) {
-    const timeDiff = Date.now() - lastCopyTime.value;
-
-    if (timeDiff < 3000) {
-      searchQuery.value = "";
-      await handleSmartSearch("");
-
-      if (listContainerRef.value) {
-        listContainerRef.value.scrollTop = 0;
-      }
-
-      activeTab.value = "all";
-    }
-  }
-};
-
-// 模糊匹配
-const fuzzyMatch = (query: string, text: string): boolean => {
-  const queryLower = query.toLowerCase();
-  const textLower = text.toLowerCase();
-  return textLower.includes(queryLower);
-};
-
-// 过滤后的历史记录
-const filteredHistory = computed(() => {
-  let result = history.value;
-
-  const pinnedSearch = pinnedSearches.value.find(
-    (ps) => ps.id === activeTab.value
-  );
-  if (pinnedSearch) {
-    const pinnedQuery = parseSearchQuery(pinnedSearch.query);
-    if (pinnedQuery.isValid) {
-      result = result.filter((item) =>
-        matchItemWithQuery(item, pinnedQuery, fuzzyMatch)
-      );
-    }
-  } else if (activeTab.value !== "all") {
-    if (activeTab.value === "file") {
-      result = result.filter(
-        (item) =>
-          item.content_type === "file" ||
-          item.content_type === "files" ||
-          item.content_type === "folder"
-      );
-    } else if (activeTab.value === "text") {
-      result = result.filter(
-        (item) =>
-          item.content_type === "text" ||
-          item.content_type === "html" ||
-          item.content_type === "rtf"
-      );
-    } else {
-      result = result.filter((item) => item.content_type === activeTab.value);
-    }
-  }
-
-  if (!pinnedSearch && parsedQuery.value.isValid) {
-    result = result.filter((item) =>
-      matchItemWithQuery(item, parsedQuery.value, fuzzyMatch)
-    );
-  }
-
-  return result;
-});
-
-// 搜索处理
-const handleSmartSearch = async (query: string) => {
-  searchQuery.value = query;
-
-  nextTick(() => {
-    // 使用虚拟滚动器滚动到顶部
-    if (scrollerRef.value) {
-      scrollerRef.value.scrollToItem(0, "start");
-    }
-    if (filteredHistory.value.length > 0) {
-      selectedIndex.value = 0;
-    }
-  });
-};
-
 const handleSearchCommit = (query: string) => {
   if (query.trim()) {
     addSearchHistory(query.trim());
     loadSearchHistory();
   }
+  handleSmartSearch(query);
 };
 
-// 标签点击
 const handleTagClick = (tag: string) => {
   const tagQuery = `@${tag}`;
   const current = searchQuery.value.trim();
@@ -407,361 +488,117 @@ const handleTagClick = (tag: string) => {
   handleSmartSearch(searchQuery.value);
 };
 
-// 项目点击处理
-const handleItemClick = async (item: ClipboardItemType, index: number) => {
-  selectedIndex.value = index;
+const handleTabClick = async (tabKey: string) => {
+  const queryWithoutTypes = removeTypeTokensFromQuery(searchQuery.value);
+  const typeToken = TAB_TYPE_TOKEN[tabKey];
+  const nextQuery = typeToken
+    ? `${queryWithoutTypes} @${typeToken}`.trim()
+    : queryWithoutTypes;
 
-  const clickAction = settings.value.click_action;
-  if (clickAction === "none") {
-    return;
-  }
-
-  const copyAsPlainText = settings.value.copy_as_plain_text;
-  await restoreToClipboard(item, { copyAsPlainText });
-
-  if (clickAction === "paste") {
-    await simulatePaste();
-  } else if (settings.value.hide_window_after_copy) {
-    await invoke("hide_clipboard_window");
-  }
+  await handleSmartSearch(nextQuery);
 };
 
-const handleItemDoubleClick = async (
-  item: ClipboardItemType,
-  index: number
-) => {
-  selectedIndex.value = index;
+const tokenizeQuery = (query: string) =>
+  query
+    .trim()
+    .split(/\s+/)
+    .filter((token) => token.length > 0);
 
-  const doubleClickAction = settings.value.double_click_action;
-  if (doubleClickAction === "none") {
-    return;
-  }
+const mergeQueryTokens = (currentQuery: string, additionalQuery: string) => {
+  const currentTokens = tokenizeQuery(currentQuery);
+  const currentTokenSet = new Set(
+    currentTokens.map((token) => token.toLowerCase()),
+  );
 
-  const copyAsPlainText = settings.value.copy_as_plain_text;
-  await restoreToClipboard(item, { copyAsPlainText });
+  const mergedTokens = [...currentTokens];
+  tokenizeQuery(additionalQuery).forEach((token) => {
+    const normalizedToken = token.toLowerCase();
+    if (currentTokenSet.has(normalizedToken)) {
+      return;
+    }
 
-  if (doubleClickAction === "paste") {
-    await simulatePaste();
-  } else if (settings.value.hide_window_after_copy) {
-    await invoke("hide_clipboard_window");
-  }
-};
-
-const handleItemContextMenu = (
-  event: MouseEvent,
-  item: ClipboardItemType,
-  index: number
-) => {
-  contextMenuPosition.value = { x: event.clientX, y: event.clientY };
-  contextMenuItem.value = item;
-  contextMenuVisible.value = true;
-  selectedIndex.value = index;
-};
-
-// 快捷操作
-const handleQuickAction = async (action: string, item: ClipboardItemType) => {
-  switch (action) {
-    case "detail":
-      drawerItem.value = item;
-      drawerVisible.value = true;
-      break;
-    case "copy":
-      await restoreToClipboard(item, {
-        copyAsPlainText: settings.value.copy_as_plain_text,
-      });
-      break;
-    case "delete":
-      await handleDelete(item);
-      break;
-    case "tag":
-      tagManagerItem.value = item;
-      tagManagerVisible.value = true;
-      break;
-  }
-};
-
-// 删除处理
-const handleDelete = async (item: ClipboardItemType) => {
-  if (settings.value.confirm_delete) {
-    itemToDelete.value = item;
-    deleteConfirmVisible.value = true;
-  } else {
-    await deleteItem(item.id);
-  }
-};
-
-const confirmDelete = async () => {
-  if (itemToDelete.value) {
-    await deleteItem(itemToDelete.value.id);
-    itemToDelete.value = null;
-  }
-  deleteConfirmVisible.value = false;
-};
-
-const cancelDelete = () => {
-  itemToDelete.value = null;
-  deleteConfirmVisible.value = false;
-};
-
-// Drawer 处理
-const handleDrawerCopy = async (item: ClipboardItemType) => {
-  await restoreToClipboard(item, {
-    copyAsPlainText: settings.value.copy_as_plain_text,
+    currentTokenSet.add(normalizedToken);
+    mergedTokens.push(token);
   });
-  if (settings.value.hide_window_after_copy) {
-    await invoke("hide_clipboard_window");
-  }
+
+  return mergedTokens.join(" ");
 };
 
-const handleDrawerPaste = async (item: ClipboardItemType) => {
-  await restoreToClipboard(item, {
-    copyAsPlainText: settings.value.copy_as_plain_text,
+const removeQueryTokens = (currentQuery: string, removableQuery: string) => {
+  const removableTokenCounts = new Map<string, number>();
+  tokenizeQuery(removableQuery).forEach((token) => {
+    const normalizedToken = token.toLowerCase();
+    removableTokenCounts.set(
+      normalizedToken,
+      (removableTokenCounts.get(normalizedToken) ?? 0) + 1,
+    );
   });
-  await simulatePaste();
+
+  return tokenizeQuery(currentQuery)
+    .filter((token) => {
+      const normalizedToken = token.toLowerCase();
+      const remainingCount = removableTokenCounts.get(normalizedToken) ?? 0;
+
+      if (remainingCount <= 0) {
+        return true;
+      }
+
+      removableTokenCounts.set(normalizedToken, remainingCount - 1);
+      return false;
+    })
+    .join(" ");
 };
 
-const handleSaveAsNew = async (content: string, type: string) => {
+const handlePinnedTabClick = async (pinnedId: string) => {
+  const pinnedSearch = pinnedSearches.value.find(
+    (item) => item.id === pinnedId,
+  );
+
+  if (!pinnedSearch) {
+    return;
+  }
+
+  const nextQuery = activePinnedIds.value.includes(pinnedId)
+    ? removeQueryTokens(searchQuery.value, pinnedSearch.query)
+    : mergeQueryTokens(searchQuery.value, pinnedSearch.query);
+
+  await handleSmartSearch(nextQuery);
+};
+
+const handleUnpinSearch = async (pinnedId: string) => {
+  const previousQuery = searchQuery.value;
+  unpinPinnedSearch(pinnedId);
+
+  if (searchQuery.value !== previousQuery) {
+    await handleSmartSearch(searchQuery.value);
+  }
+};
+
+const handleWindowFocus = async () => {
+  smartSearchRef.value?.focus();
+};
+
+const openSettings = async () => {
   try {
-    if (type === "html") {
-      await invoke("add_clipboard_item", {
-        text: content.replace(/<[^>]*>/g, ""),
-        html: content,
-      });
-    } else {
-      await invoke("add_clipboard_item", { text: content, html: null });
-    }
-    await loadHistory();
-  } catch (error) {
-    console.error("Failed to save as new:", error);
+    await invoke("show_settings_window");
+  } catch (err) {
+    console.error("Failed to open settings:", err);
   }
 };
 
-// 标签管理器处理
-const handleTagManagerSave = async (itemId: number, tags: string[]) => {
-  const item = history.value.find((h) => h.id === itemId);
-  if (item) {
-    item.tags = tags.length > 0 ? tags : undefined;
-  }
-};
-
-const handleRemoveTag = async (item: ClipboardItemType, tag: string) => {
-  try {
-    const newTags = (item.tags || []).filter((t) => t !== tag);
-    await invoke("update_tags", {
-      id: item.id,
-      tags: newTags.length > 0 ? newTags : null,
-    });
-    item.tags = newTags.length > 0 ? newTags : undefined;
-  } catch (error) {
-    console.error("Failed to remove tag:", error);
-  }
-};
-
-// 复制文件路径
-const copyFilePath = async (item: ClipboardItemType): Promise<void> => {
-  try {
-    let pathToCopy = "";
-
-    if (item.file_paths && item.file_paths.length > 0) {
-      pathToCopy = item.file_paths.join("\r\n") + "\r\n";
-    } else if (item.content) {
-      pathToCopy = item.content + "\r\n";
-    }
-
-    if (pathToCopy) {
-      await writeText(pathToCopy);
-    }
-  } catch (error) {
-    console.error("Failed to copy file path:", error);
-  }
-};
-
-// 上下文菜单动作
-const handleContextMenuAction = async (
-  action: string,
-  item: ClipboardItemType
-) => {
-  switch (action) {
-    case "copy":
-      await restoreToClipboard(item, {
-        copyAsPlainText: settings.value.copy_as_plain_text,
-      });
-      if (settings.value.hide_window_after_copy) {
-        await invoke("hide_clipboard_window");
-      }
-      break;
-    case "paste":
-      await restoreToClipboard(item, {
-        copyAsPlainText: settings.value.copy_as_plain_text,
-      });
-      await simulatePaste();
-      break;
-    case "tag":
-      tagManagerItem.value = item;
-      tagManagerVisible.value = true;
-      break;
-    case "copyPlain":
-      await restoreToClipboard({
-        ...item,
-        content_type: "text",
-        content: item.content.replace(/<[^>]*>/g, ""),
-      });
-      if (settings.value.hide_window_after_copy) {
-        await invoke("hide_clipboard_window");
-      }
-      break;
-    case "pastePlain":
-      await restoreToClipboard({
-        ...item,
-        content_type: "text",
-        content: item.content.replace(/<[^>]*>/g, ""),
-      });
-      await simulatePaste();
-      break;
-    case "delete":
-      await handleDelete(item);
-      break;
-    case "openFile":
-      if (item.file_paths && item.file_paths.length > 0) {
-        await invoke("open_file", { path: item.file_paths[0] });
-      } else if (item.thumbnail_path) {
-        await invoke("open_file", { path: item.thumbnail_path });
-      }
-      break;
-    case "showInFolder":
-      if (item.file_paths && item.file_paths.length > 0) {
-        await invoke("show_in_folder", { path: item.file_paths[0] });
-      } else if (item.thumbnail_path) {
-        await invoke("show_in_folder", { path: item.thumbnail_path });
-      }
-      break;
-    case "copyFilePath":
-      await copyFilePath(item);
-      break;
-  }
-};
-
-// 模拟粘贴
-const simulatePaste = async (): Promise<void> => {
-  try {
-    await invoke("hide_clipboard_window");
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    await invoke("simulate_paste", {
-      pasteShortcut: settings.value.paste_shortcut,
-    });
-  } catch (error) {
-    console.log("Paste simulation not available yet");
-  }
-};
-
-// 滚动处理 - 虚拟滚动器自动处理，保留加载更多逻辑
-const handleScroll = async () => {
-  // 虚拟滚动器自动处理滚动，这里保留加载更多逻辑如果需要的话
-};
-
-// 键盘导航
-const handleKeyDown = async (e: KeyboardEvent) => {
-  // Ctrl+F 聚焦搜索框
-  if ((e.ctrlKey || e.metaKey) && e.key === "f") {
-    e.preventDefault();
-    smartSearchRef.value?.focus();
-    return;
-  }
-
-  // Esc 关闭窗口
-  if (e.key === "Escape") {
-    e.preventDefault();
-    invoke("hide_clipboard_window");
-    return;
-  }
-
-  // 上下导航
-  if (e.key === "ArrowUp" || e.key === "ArrowDown") {
-    e.preventDefault();
-    const direction = e.key === "ArrowUp" ? -1 : 1;
-    const newIndex = selectedIndex.value + direction;
-
-    if (newIndex >= 0 && newIndex < filteredHistory.value.length) {
-      selectedIndex.value = newIndex;
-      scrollSelectedItemIntoView();
-    }
-    return;
-  }
-
-  // Enter 粘贴选中项
-  if (e.key === "Enter" && selectedIndex.value >= 0) {
-    e.preventDefault();
-    const item = filteredHistory.value[selectedIndex.value];
-    if (item) {
-      await restoreToClipboard(item, {
-        copyAsPlainText: settings.value.copy_as_plain_text,
-      });
-      await simulatePaste();
-    }
-    return;
-  }
-
-  // 数字键 1-9 快速粘贴
-  if (e.key >= "1" && e.key <= "9") {
-    const shortcut = settings.value.number_key_shortcut || "ctrl";
-    let shouldTrigger = false;
-
-    if (shortcut === "none") {
-      shouldTrigger = !e.ctrlKey && !e.altKey && !e.shiftKey && !e.metaKey;
-    } else {
-      const requiredModifiers = shortcut
-        .toLowerCase()
-        .split("+")
-        .map((s) => s.trim());
-      const actualModifiers: string[] = [];
-      if (e.ctrlKey) actualModifiers.push("ctrl");
-      if (e.altKey) actualModifiers.push("alt");
-      if (e.shiftKey) actualModifiers.push("shift");
-      if (e.metaKey) actualModifiers.push("meta");
-
-      const allRequiredPressed = requiredModifiers.every((mod) =>
-        actualModifiers.includes(mod)
-      );
-      const noExtraModifiers = actualModifiers.every((mod) =>
-        requiredModifiers.includes(mod)
-      );
-      shouldTrigger = allRequiredPressed && noExtraModifiers;
-    }
-
-    if (shouldTrigger) {
-      const index = parseInt(e.key) - 1;
-      if (index < filteredHistory.value.length) {
-        e.preventDefault();
-        const item = filteredHistory.value[index];
-        if (item) {
-          await restoreToClipboard(item, {
-            copyAsPlainText: settings.value.copy_as_plain_text,
-          });
-          await simulatePaste();
-        }
-      }
-    }
-    return;
-  }
-};
-
-// 滚动选中项到可视区域 - 使用虚拟滚动器的 scrollToItem
-const scrollSelectedItemIntoView = () => {
-  if (selectedIndex.value < 0 || !scrollerRef.value) return;
-
-  scrollerRef.value.scrollToItem(selectedIndex.value, "center");
-};
-
-// 生命周期
 let cleanupClipboard: (() => void) | null = null;
+let unlistenPinMode: (() => void) | null = null;
+let unlistenOpacity: (() => void) | null = null;
+let unlistenFocus: (() => void) | null = null;
+let unlistenBlur: (() => void) | null = null;
 
 onMounted(async () => {
-  // 初始化剪贴板监听
   cleanupClipboard = initClipboard();
 
-  loadHistory(settings.value.max_history_count, 0);
+  await loadHistory(settings.value.max_history_count, 0);
   loadSearchHistory();
   loadPinnedSearches();
+  loadPinMode();
   window.addEventListener("keydown", handleKeyDown);
 
   if (filteredHistory.value.length > 0) {
@@ -769,47 +606,145 @@ onMounted(async () => {
   }
 
   const appWindow = getCurrentWindow();
-  const unlistenFocus = await appWindow.listen("tauri://focus", () => {
+
+  let blurDeactivateTimer: number | null = null;
+  unlistenBlur = await appWindow.listen("tauri://blur", () => {
+    savedSearchQuery.value = searchQuery.value;
+    savedScrollPosition.value = scrollerRef.value?.$el?.scrollTop || 0;
+    selectedIndex.value = -1;
+    if (blurDeactivateTimer) clearTimeout(blurDeactivateTimer);
+    blurDeactivateTimer = window.setTimeout(() => {
+      hasActivated.value = false;
+    }, 200);
+  });
+
+  unlistenFocus = await appWindow.listen("tauri://focus", () => {
+    if (blurDeactivateTimer) {
+      clearTimeout(blurDeactivateTimer);
+      blurDeactivateTimer = null;
+    }
     if (!hasActivated.value) {
       hasActivated.value = true;
-      handleSmartActivate();
+      handleWindowFocus();
+      if (savedSearchQuery.value) {
+        searchQuery.value = savedSearchQuery.value;
+      }
+      nextTick(() => {
+        if (filteredHistory.value.length === 0) {
+          selectedIndex.value = -1;
+          return;
+        }
+
+        const restoredIndex =
+          selectedIndexFallback.value >= 0
+            ? Math.min(
+                selectedIndexFallback.value,
+                filteredHistory.value.length - 1,
+              )
+            : 0;
+
+        selectedIndex.value = restoredIndex;
+
+        if (scrollerRef.value && savedScrollPosition.value > 0) {
+          scrollerRef.value.$el.scrollTop = savedScrollPosition.value;
+        }
+      });
     }
   });
 
-  const unlistenBlur = await appWindow.listen("tauri://blur", () => {
-    hasActivated.value = false;
-  });
+  unlistenPinMode = await listen<{ pinned: boolean }>(
+    "pin-mode-changed",
+    (event) => {
+      isPinned.value = event.payload.pinned;
+    },
+  );
 
-  (window as any).__unlistenFocus = unlistenFocus;
-  (window as any).__unlistenBlur = unlistenBlur;
+  unlistenOpacity = await listen<{ opacity: number }>(
+    "window-opacity-change",
+    (event) => {
+      const opacity = event.payload.opacity;
+      document.body.style.opacity = String(opacity);
+    },
+  );
 });
 
 onUnmounted(() => {
   window.removeEventListener("keydown", handleKeyDown);
-  if ((window as any).__unlistenFocus) {
-    (window as any).__unlistenFocus();
-  }
-  if ((window as any).__unlistenBlur) {
-    (window as any).__unlistenBlur();
-  }
-  // 清理剪贴板监听
-  if (cleanupClipboard) {
-    cleanupClipboard();
-  }
+  cleanupScroll();
+  unlistenFocus?.();
+  unlistenBlur?.();
+  unlistenPinMode?.();
+  unlistenOpacity?.();
+  cleanupClipboard?.();
   hasActivated.value = false;
 });
 
-// 监听过滤变化，重置选中状态
 watch(filteredHistory, () => {
   if (selectedIndex.value >= filteredHistory.value.length) {
-    selectedIndex.value = filteredHistory.value.length > 0 ? 0 : -1;
+    selectedIndex.value =
+      filteredHistory.value.length > 0 ? filteredHistory.value.length - 1 : -1;
   } else if (selectedIndex.value < 0 && filteredHistory.value.length > 0) {
-    selectedIndex.value = 0;
+    const fallbackIndex =
+      selectedIndexFallback.value >= 0
+        ? Math.min(selectedIndexFallback.value, filteredHistory.value.length - 1)
+        : 0;
+    selectedIndex.value = fallbackIndex;
   }
 });
+
+watch(
+  history,
+  () => {
+    if (!searchQuery.value) {
+      resetDefaultList();
+    }
+  },
+  { immediate: true },
+);
 </script>
 
 <style scoped>
+/* 搜索加载指示器 */
+.search-loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 20px;
+  color: #8c8c8c;
+  font-size: 13px;
+}
+
+.search-loading .loading-spinner {
+  width: 16px;
+  height: 16px;
+  animation: spin 1s linear infinite;
+}
+
+/* 加载更多动画 */
+.loading-spinner-small {
+  width: 14px;
+  height: 14px;
+  animation: spin 1s linear infinite;
+}
+
+/* 没有更多数据提示 */
+.no-more-data {
+  text-align: center;
+  padding: 16px;
+  color: #bfbfbf;
+  font-size: 12px;
+}
+
+@keyframes spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 .clipboard-list {
   display: flex;
   flex-direction: column;
@@ -834,30 +769,34 @@ watch(filteredHistory, () => {
   gap: 8px;
 }
 
-.pin-btn {
-  width: 32px;
-  height: 32px;
+.icon-btn {
+  width: 28px;
+  height: 28px;
   display: flex;
   align-items: center;
   justify-content: center;
-  background: #f5f5f5;
-  border: 1px solid transparent;
-  border-radius: 8px;
+  background: transparent;
+  border: none;
+  border-radius: 6px;
   cursor: pointer;
   color: #8c8c8c;
   transition: all 0.2s;
   flex-shrink: 0;
+  padding: 0;
 }
 
-.pin-btn:hover {
-  background: #e6f7ff;
-  border-color: #91d5ff;
+.icon-btn:hover {
+  color: #1890ff;
+  background: rgba(24, 144, 255, 0.08);
+}
+
+.icon-btn.is-active {
   color: #1890ff;
 }
 
-.pin-btn svg {
-  width: 16px;
-  height: 16px;
+.icon-btn svg {
+  width: 18px;
+  height: 18px;
 }
 
 .list-container {
@@ -870,11 +809,6 @@ watch(filteredHistory, () => {
 .scroller {
   height: 100%;
   overflow-y: auto;
-}
-
-/* 虚拟滚动器项目容器样式 - 确保分割线正确显示 */
-.scroller :deep(.vue-recycle-scroller__item-wrapper) {
-  /* 虚拟滚动器内部包装器 */
 }
 
 .scroller :deep(.vue-recycle-scroller__item-view) {

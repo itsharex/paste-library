@@ -47,6 +47,8 @@ export interface ClipboardItem {
   content: string;
   created_at: string;
   content_hash: string;
+  // 纯文本内容（用于 HTML/RTF 类型的纯文本粘贴）
+  text_content?: string;
   // 新增字段
   metadata?: ClipboardMetadata;
   file_paths?: string[];
@@ -109,10 +111,6 @@ export interface AppSettings {
   /** 窗口位置 Y 坐标 (remember 模式使用) */
   window_pos_y?: number;
 
-  // 智能激活设置 (新增)
-  // 如果激活时间与上次复制间隔<5秒，自动回到顶部、切换全部、聚焦搜索
-  smart_activate: boolean;
-
   // 音效设置
   copy_sound: boolean;
 
@@ -139,6 +137,10 @@ export interface AppSettings {
   // 快捷键设置
   /** 数字键 1-9 快速粘贴修饰键组合，如 "ctrl", "ctrl+shift", "alt", "none" 等 */
   number_key_shortcut: string;
+
+  // 钉住模式设置
+  /** 切换钉住模式的快捷键 */
+  pin_shortcut: string;
 }
 
 /**

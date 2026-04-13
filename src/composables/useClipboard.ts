@@ -11,6 +11,7 @@ import {
   type ReadClipboard,
 } from 'tauri-plugin-clipboard-x-api';
 import type { ClipboardItem, ClipboardContentType, ClipboardMetadata, GetHistoryRequest, SearchRequest, ClearHistoryRequest } from '@/types';
+import { decodeHtmlEntities, stripHtmlAndDecode } from '@/utils/htmlUtils';
 
 const history = ref<ClipboardItem[]>([]);
 const isListening = ref(false);
@@ -107,10 +108,18 @@ export function useClipboard() {
           isInternalCopy: wasInternalCopy,
         });
       } else if (result.html) {
-        // HTML 类型
+        // HTML 类型：存储原始 HTML 内容
+        // 参考 EcoPaste 处理方式：
+        // - content: 原始 HTML
+        // - text: 剪贴板提供的纯文本（用于纯文本粘贴）
+        const htmlContent = result.html.value;
+        // 对纯文本进行 HTML 实体解码（如 &#160; -> 空格）
+        const plainText = decodeHtmlEntities(result.text?.value || '');
+
+        // 存储 HTML 内容，纯文本版本通过内存缓存
         await invoke('add_clipboard_item', {
-          text: result.text?.value || '',
-          html: result.html.value,
+          text: plainText,  // 解码后的纯文本用于预览和纯文本粘贴
+          html: htmlContent,  // 原始 HTML
           isInternalCopy: wasInternalCopy,
         });
       } else if (result.text) {
@@ -187,29 +196,63 @@ export function useClipboard() {
     await clearHistory(0, undefined);
   };
 
+  const sleep = (ms: number): Promise<void> =>
+    new Promise((resolve) => setTimeout(resolve, ms));
+
+  const restoreImageToClipboard = async (imagePath: string): Promise<void> => {
+    const maxAttempts = 3;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      try {
+        await writeImage(imagePath);
+        return;
+      } catch (error) {
+        if (attempt === maxAttempts) {
+          throw error;
+        }
+
+        // Windows 11 下图片写入剪贴板偶发句柄竞争，短暂退避后重试。
+        await sleep(50 * attempt);
+      }
+    }
+  };
+
   const restoreToClipboard = async (item: ClipboardItem, options?: { copyAsPlainText?: boolean }): Promise<void> => {
     // 标记为应用内复制（这样 handleClipboardChange 就不会更新 lastCopyTime）
     isInternalCopy.value = true;
-    
+
+    // 辅助函数：获取纯文本内容（优先使用 text_content，否则从 content 提取）
+    const getPlainText = (): string => {
+      if (item.text_content && item.text_content.trim().length > 0) {
+        return item.text_content;
+      }
+      // 备用方案：从 HTML/RTF 内容中提取纯文本（旧数据兼容）
+      if (item.content_type === 'html' || item.content_type === 'rtf') {
+        return stripHtmlAndDecode(item.content);
+      }
+      return item.content;
+    };
+
     try {
-      // 如果需要复制为纯文本，去除 HTML 标签
-      let content = item.content;
+      // 如果需要复制为纯文本，直接使用存储的纯文本内容
       if (options?.copyAsPlainText && (item.content_type === 'html' || item.content_type === 'rtf')) {
-        content = content.replace(/<[^>]*>/g, '');
-        await writeText(content);
+        await writeText(getPlainText());
         return;
       }
 
       switch (item.content_type) {
         case 'html': {
-          const plainText = item.content.replace(/<[^>]*>/g, '').trim();
-          await writeHTML(plainText, item.content);
+          // 写入原始 HTML 到剪贴板
+          // writeHTML(纯文本版本, HTML版本)
+          // 纯文本版本：item.text_content（剪贴板直接提供的纯文本，或从 HTML 提取的备用）
+          // HTML版本：item.content（原始 HTML）
+          await writeHTML(getPlainText(), item.content);
           break;
         }
         case 'image':
           // 图片类型：使用缩略图路径或内容路径
           if (item.thumbnail_path) {
-            await writeImage(item.thumbnail_path);
+            await restoreImageToClipboard(item.thumbnail_path);
           }
           break;
         case 'file':

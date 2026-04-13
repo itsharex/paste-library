@@ -13,9 +13,6 @@ const settings = ref<AppSettings>({
   window_pos_x: undefined,
   window_pos_y: undefined,
 
-  // 智能激活设置 (新增)
-  smart_activate: true,
-
   // 音效设置
   copy_sound: false,
 
@@ -41,6 +38,9 @@ const settings = ref<AppSettings>({
 
   // 快捷键设置
   number_key_shortcut: 'ctrl',
+
+  // 钉住模式设置
+  pin_shortcut: 'Ctrl+Shift+P',
 });
 
 // 全局监听器标记

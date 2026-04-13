@@ -54,12 +54,15 @@ pub struct ClipboardItem {
     pub id: i64,
     /// 内容类型
     pub content_type: ClipboardContentType,
-    /// 文本内容 (纯文本或 HTML)
+    /// 文本内容 (纯文本或 HTML/RTF 的原始内容)
     pub content: String,
     /// 创建时间
     pub created_at: DateTime<Utc>,
     /// 内容哈希 (用于去重)
     pub content_hash: String,
+    /// 纯文本内容 (用于 HTML/RTF 类型的纯文本粘贴)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text_content: Option<String>,
     /// 元数据 (图片尺寸、文件信息等)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<ClipboardMetadata>,
@@ -81,11 +84,26 @@ pub struct CreateClipboardItemRequest {
     pub content: String,
 }
 
-/// 搜索请求
+/// 搜索请求（简单查询）
 #[derive(Debug, Deserialize)]
 pub struct SearchRequest {
     pub query: String,
     pub limit: Option<i64>,
+}
+
+/// 高级搜索请求（支持标签和类型过滤）
+#[derive(Debug, Deserialize)]
+pub struct AdvancedSearchRequest {
+    /// 关键词列表（普通文本搜索词）
+    pub keywords: Vec<String>,
+    /// 标签过滤（@标签）
+    pub tags: Vec<String>,
+    /// 类型过滤（@类型）
+    pub types: Vec<ClipboardContentType>,
+    /// 返回数量限制
+    pub limit: Option<i64>,
+    /// 分页偏移量
+    pub offset: Option<i64>,
 }
 
 /// 获取历史记录的请求
@@ -120,10 +138,6 @@ pub struct AppSettings {
     pub window_pos_x: Option<i32>,
     /// 窗口位置 Y 坐标 (remember 模式使用)
     pub window_pos_y: Option<i32>,
-
-    // 智能激活设置 (新增)
-    /// 如果激活时间与上次复制间隔<5秒，自动回到顶部、切换全部、聚焦搜索
-    pub smart_activate: bool,
 
     // 音效设置
     /// 复制音效
@@ -164,6 +178,10 @@ pub struct AppSettings {
     // 快捷键设置
     /// 数字键 1-9 快速粘贴修饰键组合，如 "ctrl", "ctrl+shift", "alt", "none" 等，默认 "ctrl"
     pub number_key_shortcut: String,
+
+    // 钉住模式设置
+    /// 钉住模式快捷键（默认 "Ctrl+Shift+P"）
+    pub pin_shortcut: String,
 }
 
 impl Default for AppSettings {
@@ -177,9 +195,6 @@ impl Default for AppSettings {
             window_position: "remember".to_string(),
             window_pos_x: None,
             window_pos_y: None,
-
-            // 智能激活 (新增)
-            smart_activate: true,
 
             // 音效
             copy_sound: false,
@@ -205,6 +220,9 @@ impl Default for AppSettings {
 
             // 快捷键设置
             number_key_shortcut: "ctrl".to_string(),
+
+            // 钉住模式设置
+            pin_shortcut: "Ctrl+Shift+P".to_string(),
         }
     }
 }
